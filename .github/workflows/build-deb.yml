@@ -1,0 +1,97 @@
+name: Build Debian package (.deb)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+  release:
+    types: [ published ]
+
+jobs:
+  build-deb:
+    name: Build .deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libglib2.0-dev
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build Linux (release)
+        run: flutter build linux --release
+
+      - name: Package into .deb
+        run: |
+          set -euo pipefail
+          # Read app name and version from pubspec.yaml
+          APP_NAME="$(grep '^name:' pubspec.yaml | awk '{print $2}' || echo Bloomee)"
+          APP_NAME_LC="$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
+          VERSION="$(grep '^version:' pubspec.yaml | head -n1 | awk '{print $2}' | cut -d'+' -f1 || echo 0.0.0)"
+
+          BUNDLE_DIR=build/linux/x64/release/bundle
+          # Try common binary names
+          if [ -f "$BUNDLE_DIR/$APP_NAME" ]; then
+            BINARY="$BUNDLE_DIR/$APP_NAME"
+          elif [ -f "$BUNDLE_DIR/$APP_NAME_LC" ]; then
+            BINARY="$BUNDLE_DIR/$APP_NAME_LC"
+          else
+            echo "Binary not found in $BUNDLE_DIR"
+            ls -la "$BUNDLE_DIR" || true
+            exit 1
+          fi
+
+          PKG_DIR=debian_pkg
+          rm -rf "$PKG_DIR"
+          mkdir -p "$PKG_DIR/DEBIAN" "$PKG_DIR/usr/bin" "$PKG_DIR/usr/share/$APP_NAME_LC"
+
+          # Copy bundle contents into /usr/share/<app>
+          cp -r "$BUNDLE_DIR"/* "$PKG_DIR/usr/share/$APP_NAME_LC/"
+          # Put executable into /usr/bin
+          cp "$BINARY" "$PKG_DIR/usr/bin/$APP_NAME_LC"
+          chmod 0755 "$PKG_DIR/usr/bin/$APP_NAME_LC"
+
+          # Create control file
+          cat > "$PKG_DIR/DEBIAN/control" <<EOF
+Package: $APP_NAME_LC
+Version: $VERSION
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libgtk-3-0
+Maintainer: GitHub Actions <noreply@github.com>
+Description: $APP_NAME packaged for Debian
+EOF
+
+          DEB_NAME="${APP_NAME_LC}_${VERSION}_amd64.deb"
+          dpkg-deb --build "$PKG_DIR" "$DEB_NAME"
+          ls -la "$DEB_NAME"
+          # expose DEB_NAME to subsequent steps
+          echo "DEB_NAME=$DEB_NAME" >> $GITHUB_ENV
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: deb
+          path: "*.deb"
+
+      - name: Upload .deb to GitHub Release
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ env.DEB_NAME }}
+          asset_name: ${{ env.DEB_NAME }}
+          asset_content_type: application/vnd.debian.binary-package
